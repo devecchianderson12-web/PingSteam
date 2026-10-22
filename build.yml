@@ -1,0 +1,28 @@
+name: Compilar .exe
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar PyInstaller
+        run: pip install pyinstaller
+
+      - name: Compilar
+        run: pyinstaller --onefile --noconsole --name SteamBestServer steam_best_server.py
+
+      - name: Subir el .exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: SteamBestServer
+          path: dist/SteamBestServer.exe
