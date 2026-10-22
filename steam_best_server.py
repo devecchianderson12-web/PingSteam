@@ -1,12 +1,13 @@
 """
 Steam Best Server
-Encuentra el servidor de descarga de Steam con MAYOR VELOCIDAD REAL para tu conexion.
+Encuentra la REGION de descarga de Steam con mayor velocidad real para tu conexion.
 
 Como funciona:
   1. Pide a la API publica de Steam la lista de servidores de contenido.
-  2. Mide la latencia a todos (rapido) y se queda con los mejores candidatos de cada region.
-  3. Descarga datos reales (chunks de juegos) de cada candidato y mide MB/s.
-  4. Vuelve a probar a los 3 mas rapidos para confirmar y muestra UN solo ganador.
+  2. Mide la latencia a todos (rapido) y se queda con las mejores regiones.
+  3. Descarga datos reales (chunks de juegos) de varios servidores de cada region y mide MB/s.
+  4. Compara regiones completas (no servidores sueltos), confirma las mejores en varias
+     rondas intercaladas y muestra UN solo ganador, con el nombre que veras en Steam.
 
 Solo usa la libreria estandar de Python (sin dependencias).
 """
@@ -47,27 +48,44 @@ CHUNKS = [
     (107410, "c95b4de26d80339d69f4a8ecdc3c8614cc780783"),
 ]
 
+# codigo de aeropuerto del host -> (etiqueta como en Steam, nombre corto)
 REGIONES = {
-    "eze": "Argentina - Buenos Aires",
-    "scl": "Chile - Santiago",
-    "gru": "Brasil - Sao Paulo",
-    "lim": "Peru - Lima",
-    "bog": "Colombia - Bogota",
-    "mia": "EE.UU. - Miami",
-    "dfw": "EE.UU. - Dallas",
-    "iad": "EE.UU. - Washington",
-    "lax": "EE.UU. - Los Angeles",
-    "ord": "EE.UU. - Chicago",
-    "atl": "EE.UU. - Atlanta",
-    "sea": "EE.UU. - Seattle",
-    "jfk": "EE.UU. - Nueva York",
-    "mad": "Espana - Madrid",
-    "fra": "Alemania - Frankfurt",
-    "ams": "Paises Bajos - Amsterdam",
-    "lhr": "Reino Unido - Londres",
-    "par": "Francia - Paris",
-    "sto": "Suecia - Estocolmo",
+    "eze": ("Argentina - Buenos Aires", "Buenos Aires"),
+    "scl": ("Chile - Santiago", "Santiago"),
+    "gru": ("Brazil - Sao Paulo", "S\u00e3o Paulo"),
+    "gig": ("Brazil - Rio de Janeiro", "R\u00edo de Janeiro"),
+    "lim": ("Peru - Lima", "Lima"),
+    "bog": ("Colombia - Bogota", "Bogot\u00e1"),
+    "mia": ("US - Miami", "Miami"),
+    "dfw": ("US - Dallas", "Dallas"),
+    "iad": ("US - Washington", "Washington"),
+    "lax": ("US - Los Angeles", "Los \u00c1ngeles"),
+    "ord": ("US - Chicago", "Chicago"),
+    "atl": ("US - Atlanta", "Atlanta"),
+    "sea": ("US - Seattle", "Seattle"),
+    "jfk": ("US - New York", "Nueva York"),
+    "mad": ("Spain - Madrid", "Madrid"),
+    "fra": ("Germany - Frankfurt", "Frankfurt"),
+    "ams": ("Netherlands - Amsterdam", "\u00c1msterdam"),
+    "lhr": ("UK - London", "Londres"),
+    "par": ("France - Paris", "Par\u00eds"),
+    "sto": ("Sweden - Stockholm", "Estocolmo"),
+    "waw": ("Poland - Warsaw", "Varsovia"),
+    "vie": ("Austria - Vienna", "Viena"),
+    "hkg": ("Hong Kong", "Hong Kong"),
+    "sgp": ("Singapore", "Singapur"),
+    "tyo": ("Japan - Tokyo", "Tokio"),
+    "syd": ("Australia - Sydney", "S\u00eddney"),
+    "jnb": ("South Africa - Johannesburg", "Johannesburgo"),
+    "dxb": ("United Arab Emirates - Dubai", "Dub\u00e1i"),
 }
+
+# Perfiles de busqueda: rapida (~1 min) y profunda (~2-3 min)
+PERFILES = {
+    "rapida": dict(grupos=5, por_grupo=2, cribado=3.0, conf_regiones=2, conf_hosts=2, rondas=1, dur_conf=5.0),
+    "profunda": dict(grupos=7, por_grupo=3, cribado=2.5, conf_regiones=3, conf_hosts=2, rondas=2, dur_conf=5.0),
+}
+HILOS = 8
 
 
 def region_codigo(host):
@@ -75,11 +93,17 @@ def region_codigo(host):
     return m.group(1) if m else None
 
 
-def region_nombre(host):
+def region_info(host):
+    """(etiqueta de Steam, nombre corto) o None si el host no tiene region reconocible."""
     c = region_codigo(host)
-    if not c:
-        return ""
-    return REGIONES.get(c, c.upper())
+    if c is None:
+        return None
+    return REGIONES.get(c, (c.upper(), c.upper()))
+
+
+def nombre_corto(host):
+    i = region_info(host)
+    return i[1] if i else host
 
 
 def consultar_api(cell, n):
@@ -112,7 +136,7 @@ def obtener_servidores(amplia, prog):
                 "https": s.get("https_support") == "mandatory",
             }
 
-    prog(0.02, "Consultando servidores de Steam")
+    prog(0.01, "Consultando servidores de Steam")
     agregar(consultar_api(0, 100))
     if amplia:
         celdas = list(range(1, 251))
@@ -121,7 +145,7 @@ def obtener_servidores(amplia, prog):
             for servers in ex.map(lambda c: consultar_api(c, 20), celdas):
                 hechos += 1
                 agregar(servers)
-                prog(0.02 + 0.18 * hechos / len(celdas), "Consultando servidores de Steam")
+                prog(0.01 + 0.14 * hechos / len(celdas), "Consultando servidores de Steam")
     return encontrados
 
 
@@ -147,12 +171,13 @@ def puntaje(c):
     return c["ping"] * (1 + c["load"] / 100)
 
 
-def seleccionar_candidatos(medidos, grupos=5, por_grupo=2):
-    """Los mejores servidores de las mejores regiones (maximo grupos*por_grupo)."""
+def seleccionar_candidatos(medidos, grupos, por_grupo):
+    """Los mejores servidores de las mejores regiones (solo hosts con region reconocible)."""
+    con_region = [m for m in medidos if region_codigo(m["host"])]
+    base = con_region or medidos
     por_region = {}
-    for m in medidos:
-        clave = region_codigo(m["host"]) or m["host"]
-        por_region.setdefault(clave, []).append(m)
+    for m in base:
+        por_region.setdefault(region_codigo(m["host"]) or m["host"], []).append(m)
     ordenados = sorted(por_region.values(), key=lambda g: min(x["ping"] for x in g))
     elegidos = []
     for g in ordenados[:grupos]:
@@ -207,7 +232,7 @@ def _descargar(host, https, puerto, fin, contador, lock, idx):
         pass
 
 
-def medir_velocidad(host, https, segundos, hilos=4, puerto=None):
+def medir_velocidad(host, https, segundos, hilos=HILOS, puerto=None):
     """Descarga datos reales durante 'segundos' y devuelve MB/s (o None si no pudo)."""
     contador = [0]
     lock = threading.Lock()
@@ -229,57 +254,88 @@ def medir_velocidad(host, https, segundos, hilos=4, puerto=None):
     return contador[0] / dur / 1e6
 
 
-def buscar(amplia, prog):
+def _clave(c):
+    return region_codigo(c["host"]) or c["host"]
+
+
+def _media(v):
+    return statistics.mean(v)
+
+
+def _resultado(rep, mbs):
+    info = region_info(rep["host"])
+    return {
+        "ciudad": info[1] if info else rep["host"],
+        "etiqueta": info[0] if info else "",
+        "host": rep["host"],
+        "ping": rep["ping"],
+        "mbs": mbs,
+    }
+
+
+def buscar(amplia, profunda, prog):
+    p = PERFILES["profunda" if profunda else "rapida"]
     servers = obtener_servidores(amplia, prog)
     if not servers:
-        raise RuntimeError("No pude obtener la lista de servidores de Steam. Revisa tu conexion a internet.")
+        raise RuntimeError("No pude obtener la lista de servidores de Steam. Revisa tu conexi\u00f3n a internet.")
 
+    # 1) latencia a todos
     lista = list(servers.values())
     medidos = []
     hechos = 0
     with ThreadPoolExecutor(max_workers=32) as ex:
         for info, ping in zip(lista, ex.map(medir_latencia, lista)):
             hechos += 1
-            prog(0.20 + 0.15 * hechos / len(lista), "Midiendo latencia")
+            prog(0.15 + 0.10 * hechos / len(lista), "Midiendo latencia")
             if ping is not None:
                 info["ping"] = ping
                 medidos.append(info)
     if not medidos:
-        raise RuntimeError("Ningun servidor respondio. Puede que algo este bloqueando la conexion.")
+        raise RuntimeError("Ning\u00fan servidor respondi\u00f3. Puede que algo est\u00e9 bloqueando la conexi\u00f3n.")
 
-    cands = seleccionar_candidatos(medidos)
+    # 2) cribado: velocidad real de varios servidores por region
+    cands = seleccionar_candidatos(medidos, p["grupos"], p["por_grupo"])
     n = len(cands)
-    probados = []
     for i, c in enumerate(cands):
-        prog(0.35 + 0.45 * i / n, f"Midiendo velocidad real  ({i + 1} de {n})")
-        v = medir_velocidad(c["host"], c["https"], 3.0)
-        if v:
-            c["mbs"] = [v]
-            probados.append(c)
-
-    if not probados:
-        mejor = min(medidos, key=puntaje)
-        return {
-            "host": mejor["host"],
-            "region": region_nombre(mejor["host"]),
-            "ping": mejor["ping"],
-            "mbs": None,
-        }
-
-    probados.sort(key=lambda c: c["mbs"][0], reverse=True)
-    top = probados[:3]
-    for j, c in enumerate(top):
-        prog(0.80 + 0.19 * j / len(top), "Confirmando los mas rapidos")
-        v = medir_velocidad(c["host"], c["https"], 5.0)
+        prog(0.25 + 0.35 * i / n, f"Midiendo velocidad real  ({i + 1} de {n})")
+        c["mbs"] = []
+        v = medir_velocidad(c["host"], c["https"], p["cribado"], HILOS)
         if v:
             c["mbs"].append(v)
-    mejor = max(top, key=lambda c: statistics.mean(c["mbs"]))
-    return {
-        "host": mejor["host"],
-        "region": region_nombre(mejor["host"]),
-        "ping": mejor["ping"],
-        "mbs": statistics.mean(mejor["mbs"]),
-    }
+    probados = [c for c in cands if c["mbs"]]
+
+    if not probados:  # sin chunks disponibles: se elige por ping y carga
+        mejor = min(cands, key=puntaje)
+        return _resultado(mejor, None)
+
+    # 3) comparar REGIONES completas (promedio de sus servidores)
+    regiones = {}
+    for c in probados:
+        regiones.setdefault(_clave(c), []).append(c)
+
+    def media_region(hosts):
+        return _media([_media(h["mbs"]) for h in hosts])
+
+    top = sorted(regiones.values(), key=media_region, reverse=True)[: p["conf_regiones"]]
+    sel_por_region = [
+        sorted(g, key=lambda h: _media(h["mbs"]), reverse=True)[: p["conf_hosts"]] for g in top
+    ]
+    conf = [h for g in sel_por_region for h in g]
+
+    # 4) confirmacion en rondas intercaladas (reduce el efecto de picos de la red)
+    total = len(conf) * p["rondas"]
+    hecho = 0
+    for _ in range(p["rondas"]):
+        for h in conf:
+            prog(0.60 + 0.39 * hecho / total, f"Confirmando: {nombre_corto(h['host'])}")
+            v = medir_velocidad(h["host"], h["https"], p["dur_conf"], HILOS)
+            if v:
+                h["mbs"].append(v)
+            hecho += 1
+
+    ganadora = max(sel_por_region, key=media_region)
+    rep = max(ganadora, key=lambda h: _media(h["mbs"]))
+    return _resultado(rep, media_region(ganadora))
 
 
 # --------------------------------------------------------------------------- #
@@ -364,8 +420,8 @@ class App:
         self.t = DARK if self.dark else LIGHT
 
         root.title("Steam Best Server")
-        root.geometry(f"{self.s(780)}x{self.s(470)}")
-        root.minsize(self.s(560), self.s(400))
+        root.geometry(f"{self.s(860)}x{self.s(480)}")
+        root.minsize(self.s(760), self.s(420))
         root.configure(bg=self.t["bg"])
 
         fams = set(tkfont.families())
@@ -393,6 +449,8 @@ class App:
         self.prog_shown = 0.0
         self.resultado = None
         self.amplia = True
+        self.profunda = True
+        self.run_profunda = True
         self.hover = None
         self.hits = []
 
@@ -469,11 +527,15 @@ class App:
         x = s(14)
         x = self.item(x, cy0, "Buscar mejor servidor", "play", "buscar", self.iniciar, not corriendo, t["accent"])
         x = self.separador(x, cy0)
-        x = self.item(x, cy0, "Copiar servidor", "copy", "copiar", self.copiar, self.estado == "ok")
+        x = self.item(x, cy0, "Copiar regi\u00f3n", "copy", "copiar", self.copiar, self.estado == "ok")
         x = self.separador(x, cy0)
-        self.item(
-            x, cy0, "Probar mas regiones", "on" if self.amplia else "off", "amplia",
+        x = self.item(
+            x, cy0, "M\u00e1s regiones", "on" if self.amplia else "off", "amplia",
             self.alternar_amplia, not corriendo, t["accent"] if self.amplia else None,
+        )
+        self.item(
+            x, cy0, "B\u00fasqueda profunda", "on" if self.profunda else "off", "profunda",
+            self.alternar_profunda, not corriendo, t["accent"] if self.profunda else None,
         )
 
         # Panel de contenido
@@ -484,41 +546,49 @@ class App:
 
         if self.estado == "idle":
             self.glifo(cx, cy - s(46), "globe", t["dis"], 34)
-            c.create_text(cx, cy + s(6), text="Busca el servidor de descarga mas rapido", font=self.f_mid, fill=t["text"], width=ancho, justify="center")
-            c.create_text(cx, cy + s(38), text="Mide la velocidad real de descarga, no solo el ping.", font=self.f_text, fill=t["sub"], width=ancho, justify="center")
+            c.create_text(cx, cy + s(6), text="Busc\u00e1 el servidor de descarga m\u00e1s r\u00e1pido", font=self.f_mid, fill=t["text"], width=ancho, justify="center")
+            c.create_text(cx, cy + s(38), text="Mide la velocidad real de descarga de cada regi\u00f3n, no solo el ping.", font=self.f_text, fill=t["sub"], width=ancho, justify="center")
         elif self.estado == "run":
             c.create_text(cx, cy - s(10), text=self.status, font=self.f_mid, fill=t["text"], width=ancho, justify="center")
             c.create_text(cx, cy + s(22), text=f"{int(self.prog_shown * 100)} %", font=self.f_text, fill=t["sub"])
+            nota = "La b\u00fasqueda profunda tarda unos 2 o 3 minutos." if self.run_profunda else "La b\u00fasqueda r\u00e1pida tarda alrededor de 1 minuto."
+            c.create_text(cx, cy + s(52), text=nota, font=self.f_small, fill=t["dis"], width=ancho, justify="center")
         elif self.estado == "err":
             self.glifo(cx, cy - s(40), "warn", t["err"], 30)
             c.create_text(cx, cy + s(8), text=self.detalle, font=self.f_text, fill=t["text"], width=ancho, justify="center")
         elif self.estado == "ok":
             r = self.resultado
-            self.glifo(cx, cy - s(92), "check", t["ok"], 26)
-            c.create_text(cx, cy - s(56), text="Mejor servidor para descargar", font=self.f_text, fill=t["sub"])
+            self.glifo(cx, cy - s(96), "check", t["ok"], 26)
+            c.create_text(cx, cy - s(60), text="Mejor servidor para descargar", font=self.f_text, fill=t["sub"])
             fuente = self.f_big
             for f in (self.f_big, self.f_big2, self.f_big3):
                 fuente = f
-                if f.measure(r["host"]) <= ancho:
+                if f.measure(r["ciudad"]) <= ancho:
                     break
-            c.create_text(cx, cy - s(14), text=r["host"], font=fuente, fill=t["text"])
+            c.create_text(cx, cy - s(18), text=r["ciudad"], font=fuente, fill=t["text"])
+            if r["etiqueta"]:
+                c.create_text(cx, cy + s(22), text=r["etiqueta"], font=self.f_mid, fill=t["sub"])
             partes = []
-            if r["region"]:
-                partes.append(r["region"])
             if r["mbs"] is not None:
                 partes.append(f"{num(r['mbs'])} MB/s  ({num(r['mbs'] * 8, 0)} Mbps)")
             partes.append(f"{num(r['ping'], 0)} ms")
-            c.create_text(cx, cy + s(26), text="   \u00B7   ".join(partes), font=self.f_text, fill=t["sub"], width=ancho, justify="center")
+            c.create_text(cx, cy + s(52), text="   \u00B7   ".join(partes), font=self.f_text, fill=t["sub"], width=ancho, justify="center")
+            if r["etiqueta"]:
+                hint = f"En Steam: Configuraci\u00f3n \u203A Descargas \u203A Regi\u00f3n de descarga \u203A \"{r['etiqueta']}\" (o la m\u00e1s parecida)"
+                c.create_text(cx, cy + s(90), text=hint, font=self.f_small, fill=t["sub"], width=ancho, justify="center")
             if r["mbs"] is None:
-                aviso = "No pude medir la velocidad real; lo elegi por ping y carga."
-                c.create_text(cx, cy + s(56), text=aviso, font=self.f_small, fill=t["err"], width=ancho, justify="center")
-            if r["region"]:
-                hint = f"En Steam: Configuracion \u203A Descargas \u203A Region de descarga \u203A {r['region']} (o la mas parecida)"
-                c.create_text(cx, cy + s(86), text=hint, font=self.f_small, fill=t["sub"], width=ancho, justify="center")
+                aviso = "No pude medir la velocidad real; lo eleg\u00ed por ping y carga."
+                c.create_text(cx, cy + s(114), text=aviso, font=self.f_small, fill=t["err"], width=ancho, justify="center")
 
         # Barra de estado
         sy = h - s(20)
-        c.create_text(s(18), sy, anchor="w", text=self.status if self.estado != "run" else "Trabajando...", font=self.f_small, fill=t["sub"])
+        if self.estado == "run":
+            izq = "Trabajando..."
+        elif self.estado == "ok" and self.resultado:
+            izq = f"{self.status}   \u00B7   servidor de prueba: {self.resultado['host']}"
+        else:
+            izq = self.status
+        c.create_text(s(18), sy, anchor="w", text=izq, font=self.f_small, fill=t["sub"])
         c.create_text(w - s(18), sy, anchor="e", text="Steam Best Server", font=self.f_small, fill=t["dis"])
 
     # -- eventos ---------------------------------------------------------------
@@ -545,11 +615,16 @@ class App:
         self.amplia = not self.amplia
         self.draw()
 
+    def alternar_profunda(self):
+        self.profunda = not self.profunda
+        self.draw()
+
     def copiar(self):
         if self.resultado:
+            r = self.resultado
             self.root.clipboard_clear()
-            self.root.clipboard_append(self.resultado["host"])
-            self.status = "Servidor copiado al portapapeles"
+            self.root.clipboard_append(r["etiqueta"] or r["ciudad"])
+            self.status = "Regi\u00f3n copiada al portapapeles"
             self.draw()
 
     def iniciar(self):
@@ -560,12 +635,13 @@ class App:
         self.prog = 0.0
         self.prog_shown = 0.0
         self.resultado = None
+        self.run_profunda = self.profunda
         self.draw()
-        amplia = self.amplia
+        amplia, profunda = self.amplia, self.profunda
 
         def trabajo():
             try:
-                res = buscar(amplia, lambda f, m: self.q.put(("p", f, m)))
+                res = buscar(amplia, profunda, lambda f, m: self.q.put(("p", f, m)))
                 self.q.put(("ok", res, ""))
             except Exception as ex:
                 self.q.put(("err", str(ex), ""))
